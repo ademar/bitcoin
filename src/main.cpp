@@ -1025,6 +1025,16 @@ bool AcceptToMemoryPool(CTxMemPool& pool, CValidationState &state, const CTransa
         // Store transaction in memory
         pool.addUnchecked(hash, entry);
     }
+    
+    // Call an executable with the tx for every tx we see
+    std::string strCmd = GetArg("-txnotify", "");
+
+    if ( !strCmd.empty())
+    {
+        boost::replace_all(strCmd, "%s", tx.GetHash().GetHex());
+        boost::thread t(runCommand, strCmd); // thread runs free
+    }
+
 
     SyncWithWallets(tx, NULL);
 
