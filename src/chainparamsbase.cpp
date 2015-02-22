@@ -1,6 +1,6 @@
 // Copyright (c) 2010 Satoshi Nakamoto
-// Copyright (c) 2009-2014 The Bitcoin developers
-// Distributed under the MIT/X11 software license, see the accompanying
+// Copyright (c) 2009-2014 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "chainparamsbase.h"
@@ -9,63 +9,54 @@
 
 #include <assert.h>
 
-#include <boost/assign/list_of.hpp>
-
-using namespace boost::assign;
-
-//
-// Main network
-//
-
+/**
+ * Main network
+ */
 class CBaseMainParams : public CBaseChainParams
 {
 public:
     CBaseMainParams()
     {
-        networkID = CBaseChainParams::MAIN;
         nRPCPort = 8332;
     }
 };
 static CBaseMainParams mainParams;
 
-//
-// Testnet (v3)
-//
+/**
+ * Testnet (v3)
+ */
 class CBaseTestNetParams : public CBaseMainParams
 {
 public:
     CBaseTestNetParams()
     {
-        networkID = CBaseChainParams::TESTNET;
         nRPCPort = 18332;
         strDataDir = "testnet3";
     }
 };
 static CBaseTestNetParams testNetParams;
 
-//
-// Regression test
-//
+/*
+ * Regression test
+ */
 class CBaseRegTestParams : public CBaseTestNetParams
 {
 public:
     CBaseRegTestParams()
     {
-        networkID = CBaseChainParams::REGTEST;
         strDataDir = "regtest";
     }
 };
 static CBaseRegTestParams regTestParams;
 
-//
-// Unit test
-//
+/*
+ * Unit test
+ */
 class CBaseUnitTestParams : public CBaseMainParams
 {
 public:
     CBaseUnitTestParams()
     {
-        networkID = CBaseChainParams::UNITTEST;
         strDataDir = "unittest";
     }
 };

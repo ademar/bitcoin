@@ -1,15 +1,17 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2014 The Bitcoin developers
-// Distributed under the MIT/X11 software license, see the accompanying
+// Copyright (c) 2009-2014 The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "miner.h"
 
-#include "core.h"
+#include "amount.h"
+#include "primitives/transaction.h"
 #include "hash.h"
 #include "main.h"
 #include "net.h"
 #include "pow.h"
+#include "timedata.h"
 #include "util.h"
 #include "utilmoneystr.h"
 #ifdef ENABLE_WALLET
@@ -17,6 +19,7 @@
 #endif
 
 #include <boost/thread.hpp>
+#include <boost/tuple/tuple.hpp>
 
 using namespace std;
 
@@ -75,6 +78,15 @@ public:
     }
 };
 
+void UpdateTime(CBlockHeader* pblock, const CBlockIndex* pindexPrev)
+{
+    pblock->nTime = std::max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+
+    // Updating time can change work required on testnet:
+    if (Params().AllowMinDifficultyBlocks())
+        pblock->nBits = GetNextWorkRequired(pindexPrev, pblock);
+}
+
 CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
 {
     // Create new block
@@ -121,6 +133,7 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
     {
         LOCK2(cs_main, mempool.cs);
         CBlockIndex* pindexPrev = chainActive.Tip();
+        const int nHeight = pindexPrev->nHeight + 1;
         CCoinsViewCache view(pcoinsTip);
 
         // Priority order to process transactions
@@ -135,7 +148,7 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
              mi != mempool.mapTx.end(); ++mi)
         {
             const CTransaction& tx = mi->second.GetTx();
-            if (tx.IsCoinBase() || !IsFinalTx(tx, pindexPrev->nHeight + 1))
+            if (tx.IsCoinBase() || !IsFinalTx(tx, nHeight))
                 continue;
 
             COrphan* porphan = NULL;
@@ -178,7 +191,7 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
                 CAmount nValueIn = coins->vout[txin.prevout.n].nValue;
                 nTotalIn += nValueIn;
 
-                int nConf = pindexPrev->nHeight - coins->nHeight + 1;
+                int nConf = nHeight - coins->nHeight;
 
                 dPriority += (double)nValueIn * nConf;
             }
@@ -265,8 +278,7 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
             if (!CheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS, true))
                 continue;
 
-            CTxUndo txundo;
-            UpdateCoins(tx, state, view, txundo, pindexPrev->nHeight+1);
+            UpdateCoins(tx, state, view, nHeight);
 
             // Added
             pblock->vtx.push_back(tx);
@@ -306,8 +318,8 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
         LogPrintf("CreateNewBlock(): total size %u\n", nBlockSize);
 
         // Compute final coinbase transaction.
-        txNew.vout[0].nValue = GetBlockValue(pindexPrev->nHeight+1, nFees);
-        txNew.vin[0].scriptSig = CScript() << OP_0 << OP_0;
+        txNew.vout[0].nValue = GetBlockValue(nHeight, nFees);
+        txNew.vin[0].scriptSig = CScript() << nHeight << OP_0;
         pblock->vtx[0] = txNew;
         pblocktemplate->vTxFees[0] = -nFees;
 
@@ -318,13 +330,9 @@ CBlockTemplate* CreateNewBlock(const CScript& scriptPubKeyIn)
         pblock->nNonce         = 0;
         pblocktemplate->vTxSigOps[0] = GetLegacySigOpCount(pblock->vtx[0]);
 
-        CBlockIndex indexDummy(*pblock);
-        indexDummy.pprev = pindexPrev;
-        indexDummy.nHeight = pindexPrev->nHeight + 1;
-        CCoinsViewCache viewNew(pcoinsTip);
         CValidationState state;
-        if (!ConnectBlock(*pblock, state, &indexDummy, viewNew, true))
-            throw std::runtime_error("CreateNewBlock() : ConnectBlock failed");
+        if (!TestBlockValidity(state, *pblock, pindexPrev, false, false))
+            throw std::runtime_error("CreateNewBlock(): TestBlockValidity failed");
     }
 
     return pblocktemplate.release();
@@ -354,8 +362,6 @@ void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& 
 //
 // Internal miner
 //
-double dHashesPerSec = 0.0;
-int64_t nHPSTimerStart = 0;
 
 //
 // ScanHash scans nonces looking for a hash with at least some zero bits.
@@ -385,10 +391,8 @@ bool static ScanHash(const CBlockHeader *pblock, uint32_t& nNonce, uint256 *phas
             return true;
 
         // If nothing found after trying for a while, return -1
-        if ((nNonce & 0xffff) == 0)
-            return false;
         if ((nNonce & 0xfff) == 0)
-            boost::this_thread::interruption_point();
+            return false;
     }
 }
 
@@ -398,11 +402,11 @@ CBlockTemplate* CreateNewBlockWithKey(CReserveKey& reservekey)
     if (!reservekey.GetReservedKey(pubkey))
         return NULL;
 
-    CScript scriptPubKey = CScript() << pubkey << OP_CHECKSIG;
+    CScript scriptPubKey = CScript() << ToByteVector(pubkey) << OP_CHECKSIG;
     return CreateNewBlock(scriptPubKey);
 }
 
-bool ProcessBlockFound(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
+static bool ProcessBlockFound(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
 {
     LogPrintf("%s\n", pblock->ToString());
     LogPrintf("generated %s\n", FormatMoney(pblock->vtx[0].vout[0].nValue));
@@ -411,7 +415,7 @@ bool ProcessBlockFound(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
     {
         LOCK(cs_main);
         if (pblock->hashPrevBlock != chainActive.Tip()->GetBlockHash())
-            return error("BitcoinMiner : generated block is stale");
+            return error("BitcoinMiner: generated block is stale");
     }
 
     // Remove key from key pool
@@ -425,8 +429,8 @@ bool ProcessBlockFound(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
 
     // Process this block the same as if we had received it from another node
     CValidationState state;
-    if (!ProcessBlock(state, NULL, pblock))
-        return error("BitcoinMiner : ProcessBlock, block not accepted");
+    if (!ProcessNewBlock(state, NULL, pblock))
+        return error("BitcoinMiner: ProcessNewBlock, block not accepted");
 
     return true;
 }
@@ -472,19 +476,14 @@ void static BitcoinMiner(CWallet *pwallet)
             // Search
             //
             int64_t nStart = GetTime();
-            uint256 hashTarget = uint256().SetCompact(pblock->nBits);
+            arith_uint256 hashTarget = arith_uint256().SetCompact(pblock->nBits);
             uint256 hash;
             uint32_t nNonce = 0;
-            uint32_t nOldNonce = 0;
             while (true) {
-                bool fFound = ScanHash(pblock, nNonce, &hash);
-                uint32_t nHashesDone = nNonce - nOldNonce;
-                nOldNonce = nNonce;
-
                 // Check if something found
-                if (fFound)
+                if (ScanHash(pblock, nNonce, &hash))
                 {
-                    if (hash <= hashTarget)
+                    if (UintToArith256(hash) <= hashTarget)
                     {
                         // Found a solution
                         pblock->nNonce = nNonce;
@@ -501,35 +500,6 @@ void static BitcoinMiner(CWallet *pwallet)
                             throw boost::thread_interrupted();
 
                         break;
-                    }
-                }
-
-                // Meter hashes/sec
-                static int64_t nHashCounter;
-                if (nHPSTimerStart == 0)
-                {
-                    nHPSTimerStart = GetTimeMillis();
-                    nHashCounter = 0;
-                }
-                else
-                    nHashCounter += nHashesDone;
-                if (GetTimeMillis() - nHPSTimerStart > 4000)
-                {
-                    static CCriticalSection cs;
-                    {
-                        LOCK(cs);
-                        if (GetTimeMillis() - nHPSTimerStart > 4000)
-                        {
-                            dHashesPerSec = 1000.0 * nHashCounter / (GetTimeMillis() - nHPSTimerStart);
-                            nHPSTimerStart = GetTimeMillis();
-                            nHashCounter = 0;
-                            static int64_t nLogTime;
-                            if (GetTime() - nLogTime > 30 * 60)
-                            {
-                                nLogTime = GetTime();
-                                LogPrintf("hashmeter %6.0f khash/s\n", dHashesPerSec/1000.0);
-                            }
-                        }
                     }
                 }
 
@@ -555,7 +525,7 @@ void static BitcoinMiner(CWallet *pwallet)
             }
         }
     }
-    catch (boost::thread_interrupted)
+    catch (const boost::thread_interrupted&)
     {
         LogPrintf("BitcoinMiner terminated\n");
         throw;
